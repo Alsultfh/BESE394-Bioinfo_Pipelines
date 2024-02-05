@@ -1,0 +1,596 @@
+---
+title: "RNAseq_Bulk_Monocyte"
+author: "FATIMAH ALSULTAN"
+date: "2024-01-28"
+output: pdf_document
+---
+
+
+This workflow demonstrates a complete bioinformatics analysis of an RNA-seq study that is available from the GEO repository as series (GEO). 
+The data comes from [RNA-Seq Signatures Normalized by mRNA Abundance Allow Absolute Deconvolution of Human Immune Cell Types]
+
+(https://www.sciencedirect.com/science/article/pii/S2211124719300592?via%3Dihub)
+
+There are many steps involved in analyzing an RNA-Seq experiment. Analyzing an RNA-seq experiment begins with sequencing reads. These are aligned to a reference genome, then the number of reads mapped to each gene can be counted. This results in a table of counts, which is what we perform statistical analyses on in R.
+
+
+Both the raw data (sequence reads) and processed data (counts) were downloaded from Gene Expression Omnibus database (GEO) under accession number [GSE164457] (https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE107011).
+
+setwd("/Users/Alsultfh/Desktop/Bioinfo_pipline/DATA-Fatima")
+
+#### STEP 1.0 : Install the necessary package
+
+```{r}
+
+library(DESeq2)
+library(ggplot2)
+library(pheatmap)
+library(vsn)
+library(EnhancedVolcano)
+library(GEOquery)
+library(NOISeq)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(enrichplot)
+
+```
+
+### STEP 1.1 : load counts table from GEO
+
+```{r}
+urld <- "https://www.ncbi.nlm.nih.gov/geo/download/?format=file&type=rnaseq_counts"
+path <- paste(urld, "acc=GSE107011", "file=GSE107011_raw_counts_GRCh38.p13_NCBI.tsv.gz", sep="&");
+data_GSE107011 <- as.matrix(data.table::fread(path, header=T, colClasses="integer"), rownames=1)
+```
+
+### STEP 1.2 Downloading Metadata 
+
+```{r}
+
+
+gds <- getGEO("GSE107011")
+Meta_GSE107011 <- pData(gds$GSE107011_series_matrix.txt.gz@phenoData)
+Meta_GSE107011 <- Meta_GSE107011[,c("title","source_name_ch1","characteristics_ch1","characteristics_ch1.1", "geo_accession")]
+
+Factors_GSE107011 <- Meta_GSE107011[,c("source_name_ch1")]
+data_GSE107011
+
+
+
+
+```
+### STEP 1.3 pre-filter low count genes
+
+keep genes with at least 2 counts > 10
+
+```{r}
+
+keep <- rowSums( data_GSE107011 >= 10 ) >= 2
+data_GSE107011 <- data_GSE107011[keep, ]
+```
+
+```{r}
+
+# log transform raw counts
+dat <- log10(data_GSE107011 + 1)
+
+```
+# STEP 1.4 : Visualise the quality of the data
+
+box-and-whisker plot 
+```{r}
+
+dev.new(width=3+ncol(data_GSE107011)/6, height=5)
+par(mar=c(7,4,2,1))
+boxplot(dat, boxwex=0.7, notch=T, main="GSE107011", ylab="lg(cnt + 1)", outline=F, las=2)
+
+
+```
+This kind of plot helps in assessing the overall data quality and can also be used to compare the expression levels across different samples, conditions, or groups. 
+
+The fact that the boxes are at different levels suggests that there is variability in the central tendency of the gene expression data between the samples.There are points plotted beyond the whiskers, those could be genes with expression levels that are considered outliers.
+
+
+
+
+UMAP plot (dimensionality reduction)
+```{r}
+
+library(umap)
+dat <- dat[!duplicated(dat), ] # first remove duplicates
+ump <- umap(t(dat), n_neighbors = 14, random_state = 123)
+plot(ump$layout, main="GSE107011 UMAP plot, nbrs =14", xlab="", ylab="", pch=20, cex=1.5)
+library(car)
+pointLabel(ump$layout, labels = rownames(ump$layout), method="SANN", cex=0.6)
+
+
+```
+Good separation of clusters can indicate the presence of different cell types, high-quality data and meaningful biological variance. However, it's important to ensure that clusters are not formed due to technical artifacts such as batch effects, which can be mistakenly interpreted as biological signals.
+
+
+
+
+#PART 2.0 : QC
+
+NOISeq package consists of three modules: (1) Quality
+control of count data; (2) Normalization and low-count fltering; and (3) Differential expression analysis.
+
+we need biological information like GC, Gene lenght , chromosome, gene names. 
+
+```{r}
+
+
+# Write the names of ID 
+write.table(rownames(data_GSE107011),"gene_names_RNAseq.entrez.txt",
+            col.names = FALSE,row.names = FALSE,quote=F)
+
+# Additional Biological information optained from BioMArt 
+# https://www.ensembl.org/biomart/martview/7f2a95d66853c3b8aea7639401e47aba
+
+
+
+
+
+```
+
+##STEP 2.1: Import the information generated from BioMart
+
+
+```{r}
+
+annotgene <- read.csv("/Users/Alsultfh/Desktop/mart_export_HW.txt",sep="\t",header = T)
+
+# How many genes do I get annotated?
+sum(rownames(data_GSE107011) %in% annotgene$Entrezgene)
+#18501 genes out of 21303 genes
+
+
+
+# Filter the information
+annotgene <- annotgene[annotgene$Chromosome %in% c(as.character(1:22) ,"X","Y"),]
+sum(rownames(data_GSE107011) %in% annotgene$Entrezgene)
+
+#18482 after filtering 
+
+## Annotation
+#rownames(annotgene) <- annotgene$Entrezgene
+annotgene[annotgene$Entrezgene=="132989",]
+
+annotgene_filt <- annotgene[!duplicated(annotgene$Entrezgene),]
+sum(rownames(data_GSE107011) %in% annotgene$Entrezgene)
+sum(annotgene_filt$Entrezgene %in% rownames(data_GSE107011))
+annotgene_filt[annotgene_filt$Entrezgene=="132989",]
+
+## Overlap between annotation and gnes
+rownames(annotgene_filt) <- as.character(annotgene_filt$Entrezgene)
+sum(as.character(rownames(annotgene_filt)) %in% rownames(data_GSE107011))
+
+##  Work with the annotated genes!
+data_GSE107011_filt <- data_GSE107011[rownames(data_GSE107011) %in% rownames(annotgene_filt),]
+data_GSE107011_exc <-data_GSE107011[!(rownames(data_GSE107011) %in% rownames(annotgene_filt)),]
+annotgene_ord <- annotgene_filt[rownames(data_GSE107011_filt ),]
+
+sum(rownames(annotgene_ord)==rownames(data_GSE107011_filt))
+  
+
+
+```
+
+
+#STEP 2.2: Check that everything ready to run NOISSEQ 
+
+```{r}
+
+# READY
+data_GSE107011_filt
+annotgene_ord
+Factors_GSE107011
+  
+```
+
+
+#STEP 2.3 : Convering Data into NoisSeq object 
+```{r}
+
+
+Factors_GSE107011 <- data.frame(Meta_GSE107011 [ colnames(data_GSE107011_filt),c("source_name_ch1")])
+colnames(Factors_GSE107011)[1]<- "Group"
+
+lengthuse <- abs(annotgene_ord$Gene.end..bp.-annotgene_ord$Gene.start..bp.)
+names(lengthuse) <- rownames(annotgene_ord)
+gc <- annotgene_ord$Gene...GC.content
+names(gc) <- rownames(annotgene_ord)
+biotype <-annotgene_ord$type
+names(biotype) <- rownames(annotgene_ord)
+
+chromosome <- annotgene_ord[,c("Chromosome.scaffold.name","Gene.start..bp.","Gene.end..bp.")]
+
+
+data_NOISEQ <- readData(data = data_GSE107011_filt,
+                        length=lengthuse,
+                        gc=gc,
+                        biotype= biotype ,
+                        chromosome =      annotgene_ord[,c("Chromosome.scaffold.name","Gene.start..bp.","Gene.end..bp.")],
+                        factors = Factors_GSE107011)
+
+
+str(data_NOISEQ)
+head(assayData(data_NOISEQ)$exprs)
+head(pData(data_NOISEQ))
+head(featureData(data_NOISEQ)@data)
+
+```
+###STEP 2.4 : Exploratory plots for NoiSeq object 
+
+- Biotype detection
+- Sequencing depth & Expression Quantification
+- Sequencing bias detection 
+- Batch effect exploration
+
+
+```{r}
+# Biotype detection
+
+myexplodata <- dat(data_NOISEQ, type = "biodetection")
+explo.plot(myexplodata, plottype = "persample")
+
+par(mfrow = c(1, 2))
+explo.plot(myexplodata, samples = c(1, 2), toplot = "protein_coding", plottype = "comparison")
+
+## Count distribution per biotype
+
+mycountsbio = dat(data_NOISEQ, factor = NULL, type = "countsbio")
+explo.plot(mycountsbio, toplot = 1, samples = 1, plottype = "boxplot")
+
+## Sequencing depth & Expression Quantification 
+
+##Saturation plot 
+
+mysaturation = dat(data_NOISEQ, k = 0, ndepth = 7, type = "saturation")
+explo.plot(mysaturation, toplot = 1, samples = 1:2, yleftlim = NULL, yrightlim = NULL) #comparing 2 samples 
+explo.plot(mysaturation, toplot = "protein_coding", samples = 1:4)# comparing 4 samples 
+
+# Count distribution per sample
+explo.plot(mycountsbio, toplot = "protein_coding", samples = NULL, plottype = "boxplot")
+
+explo.plot(mycountsbio, toplot = 1, samples = NULL, plottype = "barplot")
+
+##Sequencing bias detection
+
+mylengthbias = dat(data_NOISEQ, factor = "Group", type = "lengthbias")
+explo.plot(mylengthbias,toplot = "global", samples = 1:12)
+
+## GC content bias
+
+myGCbias = dat(data_NOISEQ, factor = "Group", type = "GCbias")
+explo.plot(myGCbias, samples = 1:12, toplot = "global")
+
+
+## 3.4.3 RNA composition
+
+mycd = dat(data_NOISEQ, type = "cd", norm = FALSE, refColumn = 1)
+explo.plot(mycd,samples = 1:12)
+
+## PCA 
+
+myPCA = dat(data_NOISEQ, type = "PCA")
+explo.plot(myPCA, factor = "Group")
+
+
+```
+
+## Biotyp detection plot 
+one representing the percentage of each biotype in
+the genome being detected in the sample, and other representing the relative abundance of each biotype within
+the sample
+
+In addition,the "biotype comparisons" plot also performs a proportion test for the chosen biotype (argument
+toplot) to test if the relative abundance of that biotype is differen in the two samples or conditions compared.
+
+## Count distribution per biotype
+
+- Count distribution per biotype in one of the samples (for genes with more than 0 counts). At the upper
+part of the plot, the number of detected features within each biotype group is displayed.
+
+- The "countsbio" plot per biotype allows to see how the counts are distributed within each biological
+group. In the upper side of the plot, the number of detected features that will be represented in the boxplots
+is displayed. The values used for the boxplots are either the counts per million (if norm = FALSE) or the values
+provided by the use (if norm = TRUE)
+
+## Saturation plot 
+
+- The "Saturation" plot shows the number of features in the genome detected with more than k counts with
+the sequencing depth of the sample, and with higher and lower simulated sequencing depths
+
+
+- Distribution of counts for protein coding genes in all samples.
+
+
+
+###STEP 3.0 NORMALIZATION 
+
+```{r}
+
+
+myRPKM = rpkm(assayData(data_NOISEQ)$exprs, long = lengthuse, k = 0, lc = 1)
+myUQUA = uqua(assayData(data_NOISEQ)$exprs, long = lengthuse, lc = 0.5, k = 0)
+myTMM = tmm(assayData(data_NOISEQ)$exprs, long = 1000, lc = 0)
+
+head(myRPKM[, 1:4])
+
+```
+Saving the data 
+
+```{r}
+
+save(data_NOISEQ,data_GSE107011_filt,annotgene_ord,file="GSE107011_step1.Rda")
+
+
+```
+
+The normalization techniques implemented in NOISeq are RPKM , Upper Quartile ,and TMM, which stands for Trimmed
+Mean of M values. 
+
+
+### STEP 3.1: DESEQ2
+```{r}
+
+pDataUSE <- pData(data_NOISEQ)
+
+pDataUSE[pDataUSE=="Group:Non classical monocytes"] <- "Non classical monocytes	"
+pDataUSE[pDataUSE=="Group: Classical monocytes"] <- "Classical monocytes"
+pDataUSE[pDataUSE=="Group: Intermediate monocytes"] <- "Intermediate monocytes"
+
+pDataUSE[,1] <- as.factor(pDataUSE[,1])
+
+
+
+
+```
+
+```{r}
+
+GSE107011_DESeq2 <- DESeqDataSetFromMatrix(countData = data_GSE107011_filt,
+                              colData = pDataUSE,
+                              design = ~ Group)
+#18482 before filtering 
+
+```
+
+# STEP 3.2: Genes filtering 
+
+```{r}
+
+smallestGroupSize <- 20
+keep <- rowSums(counts(GSE107011_DESeq2) >= 10) >= smallestGroupSize
+GSE107011_DESeq2_F <- GSE107011_DESeq2[keep,]
+
+
+#15178 after filtering 
+
+
+```
+
+### STEP 3.3: DIFFERENTIAL EXPRESSION
+
+
+```{r}
+
+GSE107011_DESeq2_F<- DESeq(GSE107011_DESeq2_F)
+GSE107011_res <- results(GSE107011_DESeq2_F)
+GSE107011_res
+resultsNames(GSE107011_DESeq2_F)
+
+
+### The above generate random contrast 
+
+
+# Get the names of the results available
+results_names <- resultsNames(GSE107011_DESeq2_F)
+
+# Specify the desired contrast and obtain the results
+GSE107011_res <- results(GSE107011_DESeq2_F, contrast=c("Group", "Classical.monocytes", "Non classical monocytes"))
+
+# View the results for the specified contrast
+GSE107011_res
+
+```
+## STEP 3.4: plot MA
+
+```{r}
+
+plotMA(GSE107011_res, ylim=c(-2,2))
+
+```
+Points will be colored blue if the adjusted p value is less than 0.1. Points which fall out of the window are plotted as open triangles pointing either up or down.
+
+## STEP 3.4: plot MA with shrinking 
+
+```{r}
+
+
+lfcShrink(GSE107011_DESeq2_F,coef=c("Group_Classical.monocytes_vs_Central.memory.CD8.T.cell"))
+res_lfcShrink <- lfcShrink(GSE107011_DESeq2_F,coef=c("Group_Classical.monocytes_vs_Central.memory.CD8.T.cell"))
+
+plotMA(res_lfcShrink, ylim=c(-2,2))
+
+```
+It is more useful to visualize the MA-plot for the shrunken log2 fold changes, which remove the noise associated with log2 fold changes from low count genes without requiring arbitrary filtering thresholds.
+
+
+
+ Michael Love https://support.bioconductor.org/p/77461/
+
+
+###STEP 3.4: DIFFERENTIAL EXPRESSION -The likelihood ratio test (LRT). 
+
+Group Classical monocytes vs Central memory CD8 T cell 
+
+```{r}
+
+
+GSE107011_DESeq2_F <- DESeq(GSE107011_DESeq2_F, test="LRT", reduced=~1)
+GSE107011_DESeq2_F_res_LRT <- results(GSE107011_DESeq2_F)
+(GSE107011_DESeq2_F_res_LRT)
+res <- results(GSE107011_DESeq2_F, contrast=c("Group","Classical monocytes","Central memory CD8 T cell"))
+
+sum(res$pvalue < 0.05, na.rm=TRUE)
+#14533
+sum(res$padj < 0.1, na.rm=TRUE)
+
+#14666
+summary(res)
+
+ 
+
+```
+###STEP 3.5: Group Classical monocytes vs Central memory CD8 T cell - Down regulated genes 
+
+```{r}
+
+rownames(res) <- mapIds(org.Hs.eg.db, keys = rownames(res), keytype = "ENTREZID", column = "SYMBOL")
+
+
+resSig <- subset(res, padj < 0.1)
+head(resSig[ order(resSig$log2FoldChange), ])
+
+
+down_regulation <- (resSig[ order(resSig$log2FoldChange), ])
+
+resOrderedDF <- as.data.frame(down_regulation)[1:100, ]
+# Write the names
+
+write.csv(resOrderedDF, file = "results_down_RNA_HW.csv")
+
+write.table(rownames(down_regulation),"down_regulation_name_RNASeqHW.entrez.txt",
+            col.names = FALSE,row.names = FALSE,quote=F)
+
+
+
+
+
+```
+
+###STEP 3.6 :Group Classical monocytes vs Central memory CD8 T cell - UP regulated genes 
+
+```{r}
+
+head(resSig[ order(resSig$log2FoldChange, decreasing = TRUE), ])
+up_regulation <- (resSig[ order(resSig$log2FoldChange, decreasing = TRUE), ])
+
+resOrderedDF <- as.data.frame(up_regulation)[1:100, ]
+write.csv(resOrderedDF, file = "results_Up_RNA_HW_Week1.csv")
+##plotting result 
+topGene <- rownames(res)[which.min(res$padj)]
+
+
+# Write the names
+write.table(rownames(up_regulation),"up_regulation_name_RNA_HW_WEEK1.entrez.txt",
+            col.names = FALSE,row.names = FALSE,quote=F)
+
+
+
+
+
+```
+# STEP 4.0 : QC visualisation 
+
+```{r}
+
+vsd <- vst(GSE107011_DESeq2_F, blind=FALSE)
+#rld <- rlog(GSE107011_DESeq2_F, blind=FALSE)
+head(assay(vsd), 3)
+```
+
+```{r}
+select <- order(rowMeans(counts(GSE107011_DESeq2_F,normalized=TRUE)),
+                decreasing=TRUE)[1:20]
+df <- as.data.frame(colData(GSE107011_DESeq2_F)[,c("Group")])
+colnames(df) <- "Group"
+
+pheatmap(assay(vsd)[select,], cluster_rows=FALSE, show_rownames=FALSE,
+         cluster_cols=FALSE)
+
+# PCA
+plotPCA(vsd, intgroup=c("Group"))
+
+
+```
+PC1 explains 55% of the variance, making it the most significant component in the dataset.
+PC2 accounts for 12% of the variance, which is substantially less than PC1 but still significant.
+The plot shows distinct clusters of points, each representing different cell types.
+For example, naive CD4 T cells, naive CD8 T cells, and natural killer cells form distinct clusters, suggesting that these cell types have specific gene expression profiles that are different from each other.
+
+# STEP 5: BIOLOGICAL INTERPRETATION
+
+```{r}
+## the top 100 DE UP-reg genes 
+Up_regulated_genes <- c(
+"CXCL10", "SERPING1", "LDLRAD3", "GPR84", "ANKRD50", "LOC105376314", "IL1A", "CLEC4F", "MGAM", "SYCP2L",
+"F13A1", "EREG", "VCAN", "IL1RN", "IL1B", "GASK1B", "LILRA5", "LOC101927257", "ABHD17A", "IL36RN",
+"LOC100996634", "APOL3", "NUPR1", "EPHA2", "HSPB8", "CD163", "SLC11A1", "MCEMP1", "TRIM22", "PCSK6",
+"CXCL9", "GSTT1", "OAS1", "CD14", "S100A12", "TMEM173", "OAS3", "TM4SF19", "IFIT1", "MX1",
+"RSAD2", "IFIT3", "HERC5", "ISG15", "IFI44L", "IFIT2", "DDX58", "IFI6", "OASL", "IFI44",
+"IFITM1", "IFITM3", "LAMP3", "USP18", "SIGLEC1", "SP110", "CMPK2", "IFI27", "MX2", "PARP9",
+"SAMD9L", "IFITM2", "XAF1", "AIM2", "SAT1", "SAMHD1", "OAS2", "GBP1", "CIITA", "LGALS3BP",
+"LY6E", "BST2", "S100A8", "S100A9", "NLRP3", "CD38", "CCL3", "CCL4", "CCL20", "GNLY",
+"GZMB", "GZMH", "PRF1", "FGFBP2", "CCL4L2", "IL32", "IL7R", "FPR1", "CCR7", "CD69",
+"CD83", "SLC2A3", "SLC2A6", "CLEC5A", "CLEC4D", "CLEC4E", "CLEC12A", "SIGLEC14", "FCN1", "MNDA"
+)
+
+ego  <- enrichGO(gene = Up_regulated_genes,
+                OrgDb = org.Hs.eg.db,
+                keyType = "SYMBOL",  # Change if using a different identifier type
+                ont = "BP",  # Biological Process. Use "MF" for Molecular Function, "CC" for Cellular Component
+                pAdjustMethod = "BH",  # Adjusting for multiple testing
+                qvalueCutoff = 0.1)
+
+# View the results
+head(ego)
+
+# Example: Dotplot
+dotplot(ego)
+```
+The plot suggests that pathways related to the immune response to viruses are significantly enriched with upregulated genes in classical monocytes when compared to central memory CD8 T cells.
+
+The specific pathways, such as "response to virus", "defense response to virus", and "cytokine-mediated signaling pathway", highlight the potential roles of these upregulated genes in the immune response. The "negative regulation of viral genome replication" with a blue bubble indicates it may have a different significance level compared to other pathways, possibly due to a lower gene count or a higher p-value.
+
+
+```{r}
+Down_regulated_genes <- c(
+  "KRT1", "CTLA4", "BOK", "LCN8", "GZMK", "NELL2", "THEMIS", "CD28", "CD8A", "CD3G",
+  "ICOS", "EPHA4", "TC2N", "ABCB1", "GPR174", "GATA3", "PYHIN1", "LINC02273", "LINC01550", "ZNF831",
+  "GPR171", "ABCD2", "EOMES", "LINC00402", "ITK", "CD6", "LCK", "LOC105370259", "CD3E", "DOCK9",
+  "PATJ", "ETS1", "ZNF683", "ITM2A", "LINC00861", "KLRK1", "SH2D1A", "GPR15", "LEF1", "KLRC4-KLRK1",
+  "VSIG1", "GCSAM", "LINC02446", "IL7R", "SIT1", "EPHX2", "COL6A2", "RORC", "DKK3", "BCL11B",
+  "MAGEE1", "UBASH3A", "RIC3", "IFNG-AS1", "CD96", "MATK", "ST8SIA1", "HIP1R", "CD8B", "KLRC4",
+  "CLIC5", "SYNE2", "PDGFB", "IL2RB", "CXCR3", "TRAT1", "MAP9", "MYO6", "GZMM", "ACSL6",
+  "SCML4", "P2RY10", "CCR8", "ENPP5", "IGFBP3", "FLT4", "CD5", "KLRB1", "PI16", "WEE1",
+  "MEOX1", "KIF5C", "GOLGA7B", "SH2D3A", "IL18R1", "SKAP1", "NCALD", "RADX", "DPP4", "SIRPG-AS1",
+  "FCRL3", "BTLA", "LINC02481", "PRSS1", "IKZF3", "WNT10B", "IFNLR1", "CCDC141", "CCR6", "KLRC1"
+)
+
+ego_down <- enrichGO(gene = Down_regulated_genes,
+                OrgDb = org.Hs.eg.db,
+                keyType = "SYMBOL",  # Change if using a different identifier type
+                ont = "MF",  # Biological Process. Use "MF" for Molecular Function, "CC" for Cellular Component
+                pAdjustMethod = "BH",  # Adjusting for multiple testing
+                qvalueCutoff = 0.05)
+
+# View the results
+head(ego_down)
+
+# Example: Dotplot
+dotplot(ego_down)
+
+
+
+
+```
+
+The functions listed on the y-axis, such as "immune receptor activity," "cytokine receptor activity," "MHC class I protein binding," and others, are typically associated with the immune response. The downregulation of genes in these categories in classical monocytes compared to central memory CD8 T cells suggests that these immune functions are more active or pronounced in the CD8 T cells.
+
+Central memory CD8 T cells are known for their roles in surveillance and rapid response upon re-exposure to antigens. The downregulation of genes involved in immune receptor activity, cytokine production, and chemokine signaling in classical monocytes suggests that these cells may be less engaged in the acute response and signaling pathways that are necessary for a rapid immune response compared to central memory CD8 T cells. Instead, monocytes are typically more involved in phagocytosis and antigen-presenting functions to initiate and modulate immune responses.
+
+
+In summary, this plot indicates that when comparing classical monocytes to central memory CD8 T cells, there is a significant downregulation of genes involved in key immune signaling and response functions in the monocytes. This reflects the different roles these cell types play in the immune system, with CD8 T cells being more involved in the immediate and long-term response to pathogens, while monocytes are more geared towards antigen presentation and initiation of the immune response.
